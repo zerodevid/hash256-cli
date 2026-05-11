@@ -94,7 +94,12 @@ async function main() {
         });
 
         gpuProcess.stderr.on("data", (data) => {
-          // console.log(`GPU Log: ${data}`);
+          const log = data.toString().trim();
+          if (log.includes("Hashrate:")) {
+            process.stdout.write(`\r🚀 ${log} `);
+          } else {
+            console.log(`\nGPU Log: ${log}`);
+          }
         });
       }
     } catch (err) {

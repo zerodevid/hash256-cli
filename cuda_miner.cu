@@ -3,6 +3,7 @@
 #include <string>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <chrono>
 
 typedef unsigned char uint8_t;
 typedef unsigned long long uint64_t;
@@ -121,16 +122,28 @@ int main(int argc, char **argv) {
     cudaMemset(d_found_flag, 0, sizeof(int));
     int threads = 256;
     int blocks = 1024 * 64;
+    auto start_time = std::chrono::high_resolution_clock::now();
+    int iteration = 0;
     while (true) {
         mine_kernel<<<blocks, threads>>>(d_challenge, d_difficulty, start_nonce, d_found_nonce, d_found_flag);
         cudaDeviceSynchronize();
         cudaMemcpy(&h_found_flag, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
+        
         if (h_found_flag) {
             uint64_t h_found_nonce;
             cudaMemcpy(&h_found_nonce, d_found_nonce, sizeof(uint64_t), cudaMemcpyDeviceToHost);
             std::cout << h_found_nonce << std::endl;
             break;
         }
+
+        iteration++;
+        if (iteration % 100 == 0) {
+            auto end_time = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double> diff = end_time - start_time;
+            double hashrate = (double)iteration * blocks * threads / diff.count();
+            std::cerr << "Hashrate: " << (hashrate / 1e6) << " MH/s" << std::endl;
+        }
+
         start_nonce += (uint64_t)blocks * threads;
     }
     cudaFree(d_challenge); cudaFree(d_difficulty); cudaFree(d_found_nonce); cudaFree(d_found_flag);
