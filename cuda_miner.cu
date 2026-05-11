@@ -17,6 +17,17 @@ __constant__ uint64_t d_keccakf_rndc[24] = {
 
 #define ROL64(a, offset) (((a) << (offset)) ^ ((a) >> (64 - (offset))))
 
+__device__ __forceinline__ uint64_t bswap64(uint64_t x) {
+    return  ((x << 56) & 0xff00000000000000ULL) |
+            ((x << 40) & 0x00ff000000000000ULL) |
+            ((x << 24) & 0x0000ff0000000000ULL) |
+            ((x <<  8) & 0x000000ff00000000ULL) |
+            ((x >>  8) & 0x00000000ff000000ULL) |
+            ((x >> 24) & 0x0000000000ff0000ULL) |
+            ((x >> 40) & 0x000000000000ff00ULL) |
+            ((x >> 56) & 0x00000000000000ffULL);
+}
+
 __device__ __forceinline__ void keccakf(uint64_t s[25]) {
     int round;
     uint64_t t, bc[5];
@@ -78,27 +89,27 @@ __global__ void mine_kernel(uint64_t c0, uint64_t c1, uint64_t c2, uint64_t c3,
     s[2] = c2;
     s[3] = c3;
     
-    s[7] = __builtin_bswap64(nonce);
+    s[7] = bswap64(nonce);
     
     s[8] = 0x01;
     s[16] = 0x8000000000000000ULL;
 
     keccakf(s);
 
-    uint64_t h0 = __builtin_bswap64(s[0]);
+    uint64_t h0 = bswap64(s[0]);
     if (h0 < d0) goto found;
     if (h0 > d0) return;
     
     {
-        uint64_t h1 = __builtin_bswap64(s[1]);
+        uint64_t h1 = bswap64(s[1]);
         if (h1 < d1) goto found;
         if (h1 > d1) return;
         
-        uint64_t h2 = __builtin_bswap64(s[2]);
+        uint64_t h2 = bswap64(s[2]);
         if (h2 < d2) goto found;
         if (h2 > d2) return;
         
-        uint64_t h3 = __builtin_bswap64(s[3]);
+        uint64_t h3 = bswap64(s[3]);
         if (h3 < d3) goto found;
     }
     
