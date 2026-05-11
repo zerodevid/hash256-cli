@@ -4,9 +4,7 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <chrono>
-
-typedef unsigned char uint8_t;
-typedef unsigned long long uint64_t;
+#include <cstdint>
 
 __constant__ uint64_t d_keccakf_rndc[24] = {
     0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
