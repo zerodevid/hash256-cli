@@ -45,7 +45,18 @@ async function main() {
 
   let currentChallenge = null;
   let currentDifficulty = null;
-  let gpuProcess = null;
+  let gpuProcesses = [];
+
+  let gpuCount = 1;
+  try {
+    const { execSync } = require("child_process");
+    const smiOutput = execSync("nvidia-smi -L").toString();
+    gpuCount = smiOutput.trim().split("\n").filter(line => line.startsWith("GPU")).length;
+    if (gpuCount === 0) gpuCount = 1;
+  } catch (e) {
+    console.log("⚠️ Could not detect GPU count using nvidia-smi. Defaulting to 1.");
+  }
+  console.log(`💻 Detected ${gpuCount} GPU(s). Multi-GPU Mining Enabled!`);
 
   async function updateChallenge() {
     try {
@@ -60,47 +71,86 @@ async function main() {
         console.log(`\n🔄 New Challenge: ${challenge.substring(0,20)}...`);
         console.log(`Difficulty: ${difficulty}`);
 
-        if (gpuProcess) {
-          gpuProcess.kill();
+        if (gpuProcesses.length > 0) {
+          gpuProcesses.forEach(p => p.kill());
+          gpuProcesses = [];
         }
 
         // Convert difficulty to hex for the C++ program
         const diffHex = BigInt(difficulty).toString(16).padStart(64, "0");
         const challHex = challenge.replace("0x", "");
 
-        // Spawn GPU Miner
-        // Arguments: challenge_hex difficulty_hex start_nonce
-        const startNonce = Math.floor(Math.random() * 10000000).toString();
-        gpuProcess = spawn("./cuda_miner", [challHex, diffHex, startNonce]);
+        let hashrates = {};
+        let lastReport = Date.now();
 
-        gpuProcess.stdout.on("data", async (data) => {
-          const nonce = data.toString().trim();
-          if (nonce) {
-            console.log("\n======================================================");
-            console.log("🎉 GPU FOUND VALID NONCE:", nonce);
-            console.log("======================================================");
-            
-            try {
-              console.log("⏳ Submitting TX...");
-              const tx = await contract.mine(nonce);
-              console.log("✅ TX sent:", tx.hash);
-              await tx.wait();
-              console.log("🔥 Success!");
-            } catch (err) {
-              console.error("❌ TX failed:", err.message);
+        // Spawn GPU Miner for each detected GPU
+        for (let i = 0; i < gpuCount; i++) {
+          // Spread start nonce space to prevent GPUs from overlapping
+          const baseOffset = BigInt(i) * 1000000000000n; 
+          const randOffset = BigInt(Math.floor(Math.random() * 1000000000));
+          const startNonce = (baseOffset + randOffset).toString();
+
+          const p = spawn("./cuda_miner", [challHex, diffHex, startNonce], {
+             env: { ...process.env, CUDA_VISIBLE_DEVICES: i.toString() }
+          });
+
+          p.stdout.on("data", async (data) => {
+            const nonce = data.toString().trim();
+            if (nonce) {
+              console.log("\n======================================================");
+              console.log(`🎉 GPU [${i}] FOUND VALID NONCE:`, nonce);
+              console.log("======================================================");
+              
+              if (currentChallenge !== challenge) return; 
+
+              try {
+                console.log(`⏳ Submitting TX (from GPU ${i}) with HIGH GWEI...`);
+                
+                // Get current network fee data
+                const feeData = await provider.getFeeData();
+                let txOptions = {};
+                
+                // Multiply gas prices by 2 (200%) to ensure it gets mined aggressively
+                if (feeData.maxFeePerGas) {
+                  txOptions.maxFeePerGas = (feeData.maxFeePerGas * 200n) / 100n;
+                  // Handle potential 0n priority fee by setting a minimum if needed, but 2x is generally safe
+                  const priorityFee = feeData.maxPriorityFeePerGas || 1000000000n; // fallback to 1 gwei if null
+                  txOptions.maxPriorityFeePerGas = (priorityFee * 200n) / 100n;
+                } else if (feeData.gasPrice) {
+                  txOptions.gasPrice = (feeData.gasPrice * 200n) / 100n;
+                }
+
+                const tx = await contract.mine(nonce, txOptions);
+                console.log(`✅ TX sent: ${tx.hash} (Gas Boosted 2x!)`);
+                await tx.wait();
+                console.log("🔥 Success!");
+              } catch (err) {
+                console.error("❌ TX failed:", err.message);
+              }
+              updateChallenge(); // Refresh immediately
             }
-            updateChallenge(); // Refresh immediately
-          }
-        });
+          });
 
-        gpuProcess.stderr.on("data", (data) => {
-          const log = data.toString().trim();
-          if (log.includes("Hashrate:")) {
-            process.stdout.write(`\r🚀 ${log} `);
-          } else {
-            console.log(`\nGPU Log: ${log}`);
-          }
-        });
+          p.stderr.on("data", (data) => {
+            const log = data.toString().trim();
+            if (log.includes("Hashrate:")) {
+              const match = log.match(/Hashrate: ([\d.]+) MH\/s/);
+              if (match) {
+                hashrates[i] = parseFloat(match[1]);
+                if (Date.now() - lastReport > 2000) {
+                  const total = Object.values(hashrates).reduce((a, b) => a + b, 0).toFixed(2);
+                  const details = Object.entries(hashrates).map(([id, hr]) => `G${id}:${hr.toFixed(0)}`).join(" | ");
+                  process.stdout.write(`\r🚀 Total: ${total} MH/s [ ${details} ]   `);
+                  lastReport = Date.now();
+                }
+              }
+            } else {
+              console.log(`\nGPU [${i}] Log: ${log}`);
+            }
+          });
+
+          gpuProcesses.push(p);
+        }
       }
     } catch (err) {
       // console.error("Error fetching state:", err.message);
