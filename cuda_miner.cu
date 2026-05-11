@@ -19,6 +19,15 @@ __constant__ uint64_t d_keccakf_rndc[24] = {
 
 #define ROL64(a, offset) ((a << offset) ^ (a >> (64 - offset)))
 
+// Byte swap for uint64_t to handle Big-Endian conversion
+__device__ inline uint64_t bswap64(uint64_t val) {
+    return __byte_perm(val, 0, 0x0123) | (__byte_perm(val >> 32, 0, 0x0123) << 32);
+}
+// Correct byte swap using intrinsic
+__device__ inline uint64_t swap64(uint64_t x) {
+    return ((x << 56) | ((x << 40) & 0xff000000000000ULL) | ((x << 24) & 0xff0000000000ULL) | ((x << 8) & 0xff00000000ULL) | ((x >> 8) & 0xff000000ULL) | ((x >> 24) & 0xff0000ULL) | ((x >> 40) & 0xff00ULL) | (x >> 56));
+}
+
 __device__ void keccakf(uint64_t s[25]) {
     int i, j, round;
     uint64_t t, bc[5];
@@ -29,7 +38,6 @@ __device__ void keccakf(uint64_t s[25]) {
             for (j = 0; j < 25; j += 5) s[j + i] ^= t;
         }
         t = s[1];
-        // Optimized Rho and Pi
         s[1] = ROL64(s[6], 44); s[6] = ROL64(s[9], 20); s[9] = ROL64(s[22], 61); s[22] = ROL64(s[14], 39);
         s[14] = ROL64(s[20], 18); s[20] = ROL64(s[2], 62); s[2] = ROL64(s[12], 43); s[12] = ROL64(s[13], 25);
         s[13] = ROL64(s[19], 8); s[19] = ROL64(s[23], 56); s[23] = ROL64(s[15], 41); s[15] = ROL64(s[4], 27);
@@ -50,29 +58,58 @@ __global__ void mine_kernel(uint8_t *challenge, uint8_t *difficulty, uint64_t st
     uint64_t s[25];
     for (int i = 0; i < 25; i++) s[i] = 0;
 
-    // Challenge is 32 bytes (4 uint64)
+    // Challenge (32 bytes) - Copy directly as 64-bit lanes (Little-Endian to Little-Endian XOR)
     uint64_t *challenge64 = (uint64_t*)challenge;
     s[0] ^= challenge64[0];
     s[1] ^= challenge64[1];
     s[2] ^= challenge64[2];
     s[3] ^= challenge64[3];
 
-    // Nonce is 32 bytes (uint256), but we treat it as 8 bytes in this simplified kernel for speed
-    // and padding. Real Keccak-256 for 64 bytes total input.
-    s[4] ^= nonce; 
+    // Nonce (32 bytes uint256 in Solidity)
+    // Solidity: abi.encode(challenge, nonce) -> challenge[32] || nonce[32] (Big-Endian)
+    // Lane 4, 5, 6 will be 0 for a uint64 nonce
+    // Lane 7 gets the big-endian nonce
+    s[7] ^= swap64(nonce);
+
     // Padding for Keccak-256 (64 bytes input -> 136 bytes rate)
     s[8] ^= 0x01; 
     s[16] ^= 0x8000000000000000ULL;
 
     keccakf(s);
 
-    // Compare with difficulty (first 8 bytes for quick check)
+    // Final Hash check (Big-Endian result in s[0..3])
+    // Contract check: hash < difficulty (uint256 comparison)
     uint64_t *diff64 = (uint64_t*)difficulty;
-    // Note: Ethereum difficulty check is usually BigInt < Target. 
-    // Here we do a simplified check.
-    if (s[0] < diff64[0]) {
-        atomicExch(found_flag, 1);
-        *found_nonce = nonce;
+    
+    // We need to compare s[0..3] as Big-Endian uint256
+    // To compare easily, we swap back to little-endian host order for comparison
+    uint64_t h0 = swap64(s[0]);
+    uint64_t h1 = swap64(s[1]);
+    uint64_t h2 = swap64(s[2]);
+    uint64_t h3 = swap64(s[3]);
+
+    uint64_t d0 = swap64(diff64[0]);
+    uint64_t d1 = swap64(diff64[1]);
+    uint64_t d2 = swap64(diff64[2]);
+    uint64_t d3 = swap64(diff64[3]);
+
+    // Comparison of 256-bit Big-Endian integers (Most significant word first)
+    bool isLess = false;
+    if (h0 < d0) isLess = true;
+    else if (h0 == d0) {
+        if (h1 < d1) isLess = true;
+        else if (h1 == d1) {
+            if (h2 < d2) isLess = true;
+            else if (h2 == d2) {
+                if (h3 < d3) isLess = true;
+            }
+        }
+    }
+
+    if (isLess) {
+        if (atomicExch(found_flag, 1) == 0) {
+            *found_nonce = nonce;
+        }
     }
 }
 
@@ -84,7 +121,6 @@ int main(int argc, char **argv) {
     uint64_t start_nonce = std::stoull(argv[3]);
 
     uint8_t h_challenge[32], h_difficulty[32];
-    // Convert hex to bytes (simplified)
     for (int i = 0; i < 32; i++) {
         h_challenge[i] = std::stoi(challenge_hex.substr(i*2, 2), nullptr, 16);
         h_difficulty[i] = std::stoi(difficulty_hex.substr(i*2, 2), nullptr, 16);
@@ -104,7 +140,7 @@ int main(int argc, char **argv) {
     cudaMemset(d_found_flag, 0, sizeof(int));
 
     int threads = 256;
-    int blocks = 1024 * 64; // Adjust based on GPU
+    int blocks = 1024 * 64; 
 
     while (true) {
         mine_kernel<<<blocks, threads>>>(d_challenge, d_difficulty, start_nonce, d_found_nonce, d_found_flag);
@@ -117,7 +153,6 @@ int main(int argc, char **argv) {
             break;
         }
         start_nonce += (uint64_t)blocks * threads;
-        // Optionally output hashrate to stderr
     }
 
     cudaFree(d_challenge);
